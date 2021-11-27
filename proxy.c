@@ -1,6 +1,8 @@
-/*
- * Starter code for proxy lab.
- * Feel free to modify this code in whatever way you wish.
+/**
+ * @file proxy.c
+ * @brief A tiny proxy program
+ *
+ * @author Yujia Wang <yujiawan@andrew.cmu.edu>
  */
 
 /* Some useful includes to help you get started */
@@ -55,11 +57,6 @@ static const char *header_user_agent = "User-Agent: Mozilla/5.0"
 static const char *header_connection = "Connection: close\r\n";
 static const char *header_proxy_connection = "Proxy-Connection: close\r\n";
 
-void sigpipe_handler(int sig) {
-    printf("SIGPIPE %d handled\n", sig);
-    return;
-}
-
 /*
  * clienterror - returns an error message to the client
  */
@@ -67,48 +64,68 @@ void clienterror(int fd, char *cause, char *errnum, char *shortmsg,
                  char *longmsg) {
     char buf[MAXLINE];
     char body[MAXBUF];
+    size_t buflen;
+    size_t bodylen;
 
     /* Build the HTTP response body */
-    sprintf(body, "<html><title>Tiny Error</title>");
-    sprintf(body,
-            "%s<body bgcolor="
-            "ffffff"
-            ">\r\n",
-            body);
-    sprintf(body, "%s%s: %s\r\n", body, errnum, shortmsg);
-    sprintf(body, "%s<p>%s: %s\r\n", body, longmsg, cause);
-    sprintf(body, "%s<hr><em>The Tiny Web Server</em>\r\n", body);
+    bodylen = snprintf(body, MAXBUF,
+                       "<html>\r\n"
+                       "<head><title>Tiny Error</title></head>\r\n"
+                       "<body bgcolor=\"ffffff\">\r\n"
+                       "<h1>%s: %s</h1>\r\n"
+                       "<p>%s: %s</p>\r\n"
+                       "<hr><em>The Tiny Web server</em>\r\n"
+                       "</body></html>\r\n",
+                       errnum, shortmsg, longmsg, cause);
+    if (bodylen >= MAXBUF) {
+        return; // Overflow!
+    }
 
-    /* Print the HTTP response */
-    sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
-    rio_writen(fd, buf, strlen(buf));
-    sprintf(buf, "Content_type: text/html\r\n");
-    rio_writen(fd, buf, strlen(buf));
-    sprintf(buf, "Content-length: %d\r\n\r\n", (int)strlen(body));
-    rio_writen(fd, buf, strlen(buf));
-    rio_writen(fd, body, strlen(body));
+    /* Build the HTTP response headers */
+    buflen = snprintf(buf, MAXLINE,
+                      "HTTP/1.0 %s %s\r\n"
+                      "Content-Type: text/html\r\n"
+                      "Content-Length: %zu\r\n\r\n",
+                      errnum, shortmsg, bodylen);
+    if (buflen >= MAXLINE) {
+        return; // Overflow!
+    }
+
+    /* Write the headers */
+    if (rio_writen(fd, buf, buflen) < 0) {
+        fprintf(stderr, "Error writing error response headers to client\n");
+        return;
+    }
+
+    /* Write the body */
+    if (rio_writen(fd, body, bodylen) < 0) {
+        fprintf(stderr, "Error writing error response body to client\n");
+        return;
+    }
 }
 
-void build_http_request(rio_t *rio, const char *uri, const char *host,
-                        const char *port, char *http_request) {
-    char buf[MAXLINE], request_line[MAXLINE], header_host[MAXLINE],
-        other_header[MAXLINE];
+void build_http_request(rio_t *rio, char *request_line, char *header_host,
+                        char *http_request) {
+    char buf[MAXLINE];
+    char other_header[MAXLINE];
 
-    sprintf(request_line, "GET %s HTTP/1.0\r\n", uri);
     while (rio_readlineb(rio, buf, MAXLINE) > 0) {
-        if (!strcasecmp(buf, "\r\n")) {
+        if (!strcmp(buf, "\r\n")) {
             break;
         }
 
-        if (!strncasecmp(buf, "User-Agent", strlen("User-Agent")) ||
-            !strncasecmp(buf, "Connection", strlen("Connection")) ||
-            !strncasecmp(buf, "Proxy_Connection", strlen("Proxy_Connection"))) {
+        if (!strncasecmp(buf, "Host", strlen("Host"))) {
+            sprintf(header_host, buf);
             continue;
         }
 
-        strcat(other_header, buf);
+        if (strncasecmp(buf, "User-Agent", strlen("User-Agent")) &&
+            strncasecmp(buf, "Connection", strlen("Connection")) &&
+            strncasecmp(buf, "Proxy-Connection", strlen("Proxy-Connection"))) {
+            strcat(other_header, buf);
+        }
     }
-    sprintf(header_host, "Host: %s:%s\r\n", host, port);
+
     sprintf(http_request, "%s%s%s%s%s%s\r\n", request_line, header_host,
             header_user_agent, header_connection, header_proxy_connection,
             other_header);
@@ -116,26 +133,30 @@ void build_http_request(rio_t *rio, const char *uri, const char *host,
 
 void doit(int fd) {
     char buf[MAXLINE];
+    char request_line[MAXLINE];
+    char header_host[MAXLINE];
     char http_request[MAXLINE];
     const char *method;
     const char *version;
-    const char *uri;
     const char *host;
     const char *port;
+    const char *path;
     int serverfd;
     rio_t client_rio, server_rio;
 
-    // read request line and headers
+    // read request line
     rio_readinitb(&client_rio, fd);
     rio_readlineb(&client_rio, buf, MAXLINE);
-    printf("Request headers:\n");
+    printf("Request line:\n");
     printf("%s", buf);
 
+    // header_t *header;
     parser_t *parser = parser_new();
     parser_state state = parser_parse_line(parser, buf);
+
     if (state == ERROR) {
-        clienterror(fd, buf, "400", "Bad Rrquest",
-                    "Tiny could not handle the request");
+        clienterror(fd, buf, "400", "Bad Request",
+                    "Tiny could not handle this request (ERROR)");
         return;
     }
 
@@ -148,27 +169,34 @@ void doit(int fd) {
 
     parser_retrieve(parser, HTTP_VERSION, &version);
     if (strcasecmp(version, "1.0") && strcasecmp(version, "1.1")) {
-        clienterror(fd, buf, "400", "Bad Rrquest",
-                    "Tiny could not handle the request");
+        clienterror(fd, buf, "400", "Bad Request",
+                    "Tiny could not handle this request (HTTP_VERSION)");
         return;
     }
 
-    parser_retrieve(parser, URI, &uri);
     parser_retrieve(parser, HOST, &host);
     parser_retrieve(parser, PORT, &port);
+    parser_retrieve(parser, PATH, &path);
 
-    build_http_request(&client_rio, uri, host, port, http_request);
+    sprintf(request_line, "GET %s HTTP/1.0\r\n", path);
+    sprintf(header_host, "Host: %s:%s\r\n", host, port);
 
+    build_http_request(&client_rio, request_line, header_host, http_request);
+
+    // establish connection to the web server
     serverfd = open_clientfd(host, port);
     if (serverfd < 0) {
         fprintf(stderr, "Connection failed\n");
         return;
     }
+
+    // request the object the client specified
     rio_readinitb(&server_rio, serverfd);
     rio_writen(serverfd, http_request, strlen(http_request));
 
+    // read the server's response and forward it to the client
     ssize_t n;
-    while ((n = rio_readlineb(&server_rio, buf, MAXLINE)) > 0) {
+    while ((n = rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
         rio_writen(fd, buf, n);
     }
 
@@ -181,7 +209,7 @@ int main(int argc, char **argv) {
     int listenfd, connfd;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
-    char hostname[MAXLINE], port[MAXLINE];
+    char host[MAXLINE], port[MAXLINE];
 
     // check command line arguments
     if (argc != 2) {
@@ -189,8 +217,7 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    Signal(SIGPIPE, sigpipe_handler);
-    // signal(SIGPIPE, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
 
     listenfd = open_listenfd(argv[1]);
     if (listenfd < 0) {
@@ -202,12 +229,12 @@ int main(int argc, char **argv) {
         clientlen = sizeof(clientaddr);
         connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
         if (connfd < 0) {
-            perror("accept");
+            perror("accept error");
             continue;
         }
-        getnameinfo((struct sockaddr *)&clientaddr, clientlen, hostname,
-                    MAXLINE, port, MAXLINE, 0);
-        printf("Accepted connection from (%s, %s)\n", hostname, port);
+        getnameinfo((struct sockaddr *)&clientaddr, clientlen, host, MAXLINE,
+                    port, MAXLINE, 0);
+        printf("Accepted connection from (%s, %s)\n", host, port);
         doit(connfd);
         close(connfd);
     }
