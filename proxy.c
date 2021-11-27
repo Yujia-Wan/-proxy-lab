@@ -205,11 +205,23 @@ void doit(int fd) {
     return;
 }
 
+void *thread(void *vargp) {
+    int connfd = *((int *)vargp);
+    pthread_detach(pthread_self());
+    free(vargp);
+    doit(connfd);
+    close(connfd);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
-    int listenfd, connfd;
+    int listenfd;
+    int *connfdp;
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
-    char host[MAXLINE], port[MAXLINE];
+    char host[MAXLINE];
+    char port[MAXLINE];
+    pthread_t tid;
 
     // check command line arguments
     if (argc != 2) {
@@ -227,16 +239,16 @@ int main(int argc, char **argv) {
 
     while (1) {
         clientlen = sizeof(clientaddr);
-        connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
-        if (connfd < 0) {
+        connfdp = malloc(sizeof(int));
+        *connfdp = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
+        if (*connfdp < 0) {
             perror("accept error");
             continue;
         }
         getnameinfo((struct sockaddr *)&clientaddr, clientlen, host, MAXLINE,
                     port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", host, port);
-        doit(connfd);
-        close(connfd);
+        pthread_create(&tid, NULL, thread, connfdp);
     }
 
     return 0;
