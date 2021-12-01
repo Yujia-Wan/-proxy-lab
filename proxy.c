@@ -7,6 +7,7 @@
 
 /* Some useful includes to help you get started */
 
+#include "cache.h"
 #include "csapp.h"
 #include "http_parser.h"
 
@@ -138,17 +139,17 @@ void doit(int fd) {
     char http_request[MAXLINE];
     const char *method;
     const char *version;
+    const char *uri;
     const char *host;
     const char *port;
     const char *path;
     int serverfd;
     rio_t client_rio, server_rio;
+    ssize_t n;
 
     // read request line
     rio_readinitb(&client_rio, fd);
     rio_readlineb(&client_rio, buf, MAXLINE);
-    printf("Request line:\n");
-    printf("%s", buf);
 
     // header_t *header;
     parser_t *parser = parser_new();
@@ -168,9 +169,16 @@ void doit(int fd) {
     }
 
     parser_retrieve(parser, HTTP_VERSION, &version);
-    if (strcasecmp(version, "1.0") && strcasecmp(version, "1.1")) {
+    if (strncasecmp(version, "1.0", strlen("1.0")) &&
+        strncasecmp(version, "1.1", strlen("1.1"))) {
         clienterror(fd, buf, "400", "Bad Request",
                     "Tiny could not handle this request (HTTP_VERSION)");
+        return;
+    }
+
+    // read cache and if in the cache, write back to the client
+    parser_retrieve(parser, URI, &uri);
+    if ((n = read_cache(uri, fd)) > 0) {
         return;
     }
 
@@ -183,7 +191,7 @@ void doit(int fd) {
 
     build_http_request(&client_rio, request_line, header_host, http_request);
 
-    // establish connection to the web server
+    // if not in the cache, establish connection to the web server
     serverfd = open_clientfd(host, port);
     if (serverfd < 0) {
         fprintf(stderr, "Connection failed\n");
@@ -195,9 +203,23 @@ void doit(int fd) {
     rio_writen(serverfd, http_request, strlen(http_request));
 
     // read the server's response and forward it to the client
-    ssize_t n;
+    ssize_t response_size = 0;
+    char response[MAX_OBJECT_SIZE];
+    char *responsep = response;
     while ((n = rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
         rio_writen(fd, buf, n);
+        // store the web server's response if maximum object size is not
+        // exceeded
+        response_size += n;
+        if (response_size < MAX_OBJECT_SIZE) {
+            memcpy(responsep, buf, n);
+            responsep += n;
+        }
+    }
+
+    // write the web object into cache
+    if (response_size < MAX_OBJECT_SIZE) {
+        write_cache(uri, response, response_size);
     }
 
     parser_free(parser);
@@ -231,6 +253,8 @@ int main(int argc, char **argv) {
 
     signal(SIGPIPE, SIG_IGN);
 
+    init_cache();
+
     listenfd = open_listenfd(argv[1]);
     if (listenfd < 0) {
         fprintf(stderr, "Failed to listen on port: %s\n", argv[1]);
@@ -247,9 +271,11 @@ int main(int argc, char **argv) {
         }
         getnameinfo((struct sockaddr *)&clientaddr, clientlen, host, MAXLINE,
                     port, MAXLINE, 0);
-        printf("Accepted connection from (%s, %s)\n", host, port);
+        sio_printf("Accepted connection from (%s, %s)\n", host, port);
         pthread_create(&tid, NULL, thread, connfdp);
     }
+
+    free_cache();
 
     return 0;
 }
