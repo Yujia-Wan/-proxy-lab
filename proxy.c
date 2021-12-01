@@ -2,10 +2,14 @@
  * @file proxy.c
  * @brief A tiny proxy program
  *
+ * This program implements a proxy that accepts incoming connections, reads and
+ * parses requests, forwards requests to web servers, reads the servers'
+ * responses, and forwards the responses to the corresponding clients. Also, the
+ * proxy supports multiple concurrent connections, and a simple main memory
+ * cache of recently accessed web content is added.
+ *
  * @author Yujia Wang <yujiawan@andrew.cmu.edu>
  */
-
-/* Some useful includes to help you get started */
 
 #include "cache.h"
 #include "csapp.h"
@@ -40,13 +44,6 @@
 #define dbg_assert(...)
 #define dbg_printf(...)
 #endif
-
-/*
- * Max cache and object sizes
- * You might want to move these to the file containing your cache implementation
- */
-#define MAX_CACHE_SIZE (1024 * 1024)
-#define MAX_OBJECT_SIZE (100 * 1024)
 
 /*
  * String to use for the User-Agent header.
@@ -105,21 +102,31 @@ void clienterror(int fd, char *cause, char *errnum, char *shortmsg,
     }
 }
 
+/**
+ * @brief Build HTTP request headers of proxy sent to server
+ * @param rio[in] Robust I/O package
+ * @param request_line[in] Request line of proxy
+ * @param header_host[in] Host header
+ * @param http_request[out] HTTP request sent to server
+ */
 void build_http_request(rio_t *rio, char *request_line, char *header_host,
                         char *http_request) {
     char buf[MAXLINE];
     char other_header[MAXLINE];
 
+    // assume that the request and header lines are ASCII text
     while (rio_readlineb(rio, buf, MAXLINE) > 0) {
         if (!strcmp(buf, "\r\n")) {
             break;
         }
 
+        // if client attaches its own HOST header, use the same as client
         if (!strncasecmp(buf, "Host", strlen("Host"))) {
             sprintf(header_host, buf);
             continue;
         }
 
+        // if client sends additional request headers, forward them unchanged
         if (strncasecmp(buf, "User-Agent", strlen("User-Agent")) &&
             strncasecmp(buf, "Connection", strlen("Connection")) &&
             strncasecmp(buf, "Proxy-Connection", strlen("Proxy-Connection"))) {
@@ -132,6 +139,10 @@ void build_http_request(rio_t *rio, char *request_line, char *header_host,
             other_header);
 }
 
+/**
+ * @brief Handle a HTTP request
+ * @param[in] fd Connected descriptor
+ */
 void doit(int fd) {
     char buf[MAXLINE];
     char request_line[MAXLINE];
@@ -151,10 +162,10 @@ void doit(int fd) {
     rio_readinitb(&client_rio, fd);
     rio_readlineb(&client_rio, buf, MAXLINE);
 
-    // header_t *header;
     parser_t *parser = parser_new();
     parser_state state = parser_parse_line(parser, buf);
 
+    // error handling
     if (state == ERROR) {
         clienterror(fd, buf, "400", "Bad Request",
                     "Tiny could not handle this request (ERROR)");
@@ -176,12 +187,13 @@ void doit(int fd) {
         return;
     }
 
-    // read cache and if in the cache, write back to the client
+    // retrieve cache and if the URI is in the cache, respond to client directly
     parser_retrieve(parser, URI, &uri);
     if ((n = read_cache(uri, fd)) > 0) {
         return;
     }
 
+    // not in the cache, build http request forwarded to web server
     parser_retrieve(parser, HOST, &host);
     parser_retrieve(parser, PORT, &port);
     parser_retrieve(parser, PATH, &path);
@@ -191,7 +203,7 @@ void doit(int fd) {
 
     build_http_request(&client_rio, request_line, header_host, http_request);
 
-    // if not in the cache, establish connection to the web server
+    // establish connection to the web server
     serverfd = open_clientfd(host, port);
     if (serverfd < 0) {
         fprintf(stderr, "Connection failed\n");
@@ -202,12 +214,13 @@ void doit(int fd) {
     rio_readinitb(&server_rio, serverfd);
     rio_writen(serverfd, http_request, strlen(http_request));
 
-    // read the server's response and forward it to the client
     ssize_t response_size = 0;
     char response[MAX_OBJECT_SIZE];
     char *responsep = response;
+    // read the server's response and forward it to the client
     while ((n = rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
         rio_writen(fd, buf, n);
+
         // store the web server's response if maximum object size is not
         // exceeded
         response_size += n;
@@ -227,8 +240,14 @@ void doit(int fd) {
     return;
 }
 
+/**
+ * @brief Thread routine
+ * @param[in] vargp Variable pointer to connected descriptor
+ */
 void *thread(void *vargp) {
     int connfd = *((int *)vargp);
+    // detach threads so that spare resources are automatically reaped upon
+    // thread exit
     pthread_detach(pthread_self());
     free(vargp);
     doit(connfd);
@@ -236,6 +255,9 @@ void *thread(void *vargp) {
     return NULL;
 }
 
+/**
+ * The tiny proxy's main routine
+ */
 int main(int argc, char **argv) {
     int listenfd;
     int *connfdp;
@@ -251,10 +273,12 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    // ignore SIGPIPE signals
     signal(SIGPIPE, SIG_IGN);
 
     init_cache();
 
+    // open a listening socket
     listenfd = open_listenfd(argv[1]);
     if (listenfd < 0) {
         fprintf(stderr, "Failed to listen on port: %s\n", argv[1]);
@@ -264,6 +288,7 @@ int main(int argc, char **argv) {
     while (1) {
         clientlen = sizeof(clientaddr);
         connfdp = malloc(sizeof(int));
+        // accept a connection request
         *connfdp = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
         if (*connfdp < 0) {
             perror("accept error");
@@ -272,6 +297,7 @@ int main(int argc, char **argv) {
         getnameinfo((struct sockaddr *)&clientaddr, clientlen, host, MAXLINE,
                     port, MAXLINE, 0);
         sio_printf("Accepted connection from (%s, %s)\n", host, port);
+        // create a new peer thread to perform a treansaction
         pthread_create(&tid, NULL, thread, connfdp);
     }
 

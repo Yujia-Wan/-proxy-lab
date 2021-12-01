@@ -1,5 +1,10 @@
 /**
  * @file cache.c
+ * @brief A simple cache of recently accessed web content
+ *
+ * This program implements a cache to the proxy that keeps recently used web
+ * objects in memory. It stores the URL of a GET request as a key, and the
+ * received corresponding web object from the server limited by maximum size.
  *
  * @author Yujia Wang <yujiawan@andrew.cmu.edu>
  */
@@ -104,16 +109,13 @@ void insert_head(cache_block_t *block) {
     return;
 }
 
-// do eviction, remove the tail of the list
 void remove_tail() {
     if (cache->tail == NULL) {
         return;
     }
 
+    // do eviction, remove the tail of the list
     cache_block_t *old_tail = cache->tail;
-    sio_printf("\ntail to be removed:\n");
-    sio_printf("  address    : %p\n", old_tail);
-    sio_printf("  url        : %s\n", old_tail->url);
     if (cache->tail->prev == NULL) {
         // only one block in cache
         cache->head = NULL;
@@ -137,10 +139,11 @@ ssize_t read_cache(const char *uri, int fd) {
     cache_block_t *block = cache->head;
     while (block != NULL) {
         if (!strncasecmp(uri, block->url, strlen(uri))) {
-            // move the object to the head of the list
             if (block != cache->head) {
+                // move the object to the head of the list
                 block->prev->next = block->next;
                 if (block == cache->tail) {
+                    // update cache tail
                     cache->tail = block->prev;
                 } else {
                     block->next->prev = block->prev;
@@ -149,15 +152,15 @@ ssize_t read_cache(const char *uri, int fd) {
                 block->next = NULL;
                 insert_head(block);
             } else {
+                // if head matches, simply add reference count
                 block->reference_count++;
             }
 
             // release lock before transmitting the object to the client
             pthread_mutex_unlock(&mutex);
 
-            // write the cached web object to the client
+            // forward the cached web object to the client
             rio_writen(fd, block->object, block->object_size);
-            sio_printf("\nwrite cache object to client\n");
 
             // decrement reference count when it is done transmitting the object
             // to a client
@@ -169,6 +172,8 @@ ssize_t read_cache(const char *uri, int fd) {
         }
         block = block->next;
     }
+
+    // URL not found
     pthread_mutex_unlock(&mutex);
     return -1;
 }
@@ -176,7 +181,7 @@ ssize_t read_cache(const char *uri, int fd) {
 void write_cache(const char *uri, char object[], ssize_t object_size) {
     pthread_mutex_lock(&mutex);
 
-    // first check uniqueness, if already in cache, return
+    // check uniqueness, if the URL is already in cache, return
     cache_block_t *block = cache->head;
     while (block != NULL) {
         if (!strncasecmp(uri, block->url, strlen(uri))) {
@@ -187,9 +192,12 @@ void write_cache(const char *uri, char object[], ssize_t object_size) {
     }
 
     while (cache->size + object_size > MAX_CACHE_SIZE) {
+        // eviction
         remove_tail();
     }
 
+    // store the web object with its URL in a new cache block and insert to the
+    // head of the list
     block = alloc_block(uri, object, object_size);
     insert_head(block);
     cache->size += object_size;
